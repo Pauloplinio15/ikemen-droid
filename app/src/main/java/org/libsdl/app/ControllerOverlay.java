@@ -1,15 +1,27 @@
 package org.libsdl.app;
 
 import android.content.Context;
+import android.content.SharedPreferences;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.Paint;
+import android.graphics.RectF;
+import android.view.Gravity;
+import android.view.HapticFeedbackConstants;
 import android.view.InputDevice;
 import android.view.LayoutInflater;
 import android.view.MotionEvent;
+import android.view.ScaleGestureDetector;
 import android.view.View;
 import android.view.ViewGroup;
+import android.widget.Button;
+import android.widget.LinearLayout;
 import android.widget.RelativeLayout;
+import android.widget.TextView;
 
 import org.ikemen_engine.ikemen_go.R;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
@@ -20,6 +32,343 @@ public class ControllerOverlay extends RelativeLayout {
     private int hatX, hatY = 0;
     private final Map<Integer, Set<Integer>> pointerStates = new HashMap<>(); // PointerID -> Keycode/Axis
     private boolean isInitialized = false;
+
+    // =====================================================================
+    // Layout editor: long-press the gear (top-left) to move / resize controls
+    // =====================================================================
+    private static final String PREFS_NAME = "controller_layout";
+    private static final float MIN_SCALE = 0.4f;
+    private static final float MAX_SCALE = 3.0f;
+
+    private final int[] editableIds = {
+            R.id.dpad_container, R.id.left_analog, R.id.right_analog,
+            R.id.btn_a, R.id.btn_b, R.id.btn_c, R.id.btn_d,
+            R.id.btn_w, R.id.btn_x, R.id.btn_y, R.id.btn_z,
+            R.id.btn_back, R.id.btn_start
+    };
+    private final String[] editableNames = {
+            "dpad", "left_analog", "right_analog",
+            "btn_a", "btn_b", "btn_c", "btn_d",
+            "btn_w", "btn_x", "btn_y", "btn_z",
+            "btn_back", "btn_start"
+    };
+
+    private boolean editMode = false;
+    private View selectedView = null;
+    private boolean dragging = false;
+    private float lastTouchX, lastTouchY;
+    private int togglePointerId = -1;
+    private TextView editToggle;
+    private LinearLayout editToolbar;
+    private ScaleGestureDetector scaleDetector;
+    private final Paint outlinePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint selectedPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+
+    private final Runnable enterEditRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (togglePointerId != -1) {
+                performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+                enterEditMode();
+            }
+        }
+    };
+
+    private SharedPreferences layoutPrefs() {
+        return getContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+    }
+
+    private void loadLayout() {
+        SharedPreferences p = layoutPrefs();
+        for (int i = 0; i < editableIds.length; i++) {
+            View v = findViewById(editableIds[i]);
+            if (v == null) continue;
+            String n = editableNames[i];
+            v.setTranslationX(p.getFloat(n + "_tx", 0f));
+            v.setTranslationY(p.getFloat(n + "_ty", 0f));
+            float sc = p.getFloat(n + "_s", 1f);
+            v.setScaleX(sc);
+            v.setScaleY(sc);
+        }
+    }
+
+    private void saveLayout() {
+        SharedPreferences.Editor e = layoutPrefs().edit();
+        for (int i = 0; i < editableIds.length; i++) {
+            View v = findViewById(editableIds[i]);
+            if (v == null) continue;
+            String n = editableNames[i];
+            e.putFloat(n + "_tx", v.getTranslationX());
+            e.putFloat(n + "_ty", v.getTranslationY());
+            e.putFloat(n + "_s", v.getScaleX());
+        }
+        e.apply();
+    }
+
+    private void resetLayout() {
+        for (int id : editableIds) {
+            View v = findViewById(id);
+            if (v == null) continue;
+            v.setTranslationX(0f);
+            v.setTranslationY(0f);
+            v.setScaleX(1f);
+            v.setScaleY(1f);
+        }
+        saveLayout();
+        invalidate();
+    }
+
+    private void buildEditorUi(Context context) {
+        outlinePaint.setStyle(Paint.Style.STROKE);
+        outlinePaint.setStrokeWidth(dpToPx(2));
+        outlinePaint.setColor(0xAAFFFFFF);
+        selectedPaint.setStyle(Paint.Style.STROKE);
+        selectedPaint.setStrokeWidth(dpToPx(3));
+        selectedPaint.setColor(0xFFFFC107);
+
+        // Gear: long-press (~0.7s) to enter edit mode
+        editToggle = new TextView(context);
+        editToggle.setText("\u2699");
+        editToggle.setTextColor(Color.WHITE);
+        editToggle.setTextSize(22);
+        editToggle.setGravity(Gravity.CENTER);
+        editToggle.setAlpha(0.4f);
+        RelativeLayout.LayoutParams tp = new RelativeLayout.LayoutParams(dpToPx(44), dpToPx(44));
+        tp.addRule(RelativeLayout.ALIGN_PARENT_TOP);
+        tp.addRule(RelativeLayout.ALIGN_PARENT_LEFT);
+        tp.setMargins(dpToPx(8), dpToPx(8), 0, 0);
+        addView(editToggle, tp);
+
+        // Toolbar (only visible in edit mode)
+        editToolbar = new LinearLayout(context);
+        editToolbar.setOrientation(LinearLayout.HORIZONTAL);
+        editToolbar.setGravity(Gravity.CENTER_VERTICAL);
+        editToolbar.setBackgroundColor(0xCC000000);
+        editToolbar.setPadding(dpToPx(8), dpToPx(4), dpToPx(8), dpToPx(4));
+        editToolbar.setVisibility(View.GONE);
+
+        TextView hint = new TextView(context);
+        hint.setText("Arraste: mover  |  Pin\u00e7a ou \u2212 / +: tamanho");
+        hint.setTextColor(Color.WHITE);
+        hint.setTextSize(12);
+        hint.setPadding(0, 0, dpToPx(8), 0);
+        editToolbar.addView(hint);
+
+        addToolbarButton("\u2212", new Runnable() {
+            @Override public void run() { scaleSelected(0.9f); }
+        });
+        addToolbarButton("+", new Runnable() {
+            @Override public void run() { scaleSelected(1.1f); }
+        });
+        addToolbarButton("Reset", new Runnable() {
+            @Override public void run() { resetLayout(); }
+        });
+        addToolbarButton("OK", new Runnable() {
+            @Override public void run() { exitEditMode(); }
+        });
+
+        RelativeLayout.LayoutParams lp = new RelativeLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.addRule(RelativeLayout.ALIGN_PARENT_TOP);
+        lp.addRule(RelativeLayout.CENTER_HORIZONTAL);
+        addView(editToolbar, lp);
+
+        scaleDetector = new ScaleGestureDetector(context,
+                new ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                    @Override
+                    public boolean onScaleBegin(ScaleGestureDetector d) {
+                        if (selectedView == null) {
+                            selectedView = editableAt(d.getFocusX(), d.getFocusY());
+                            invalidate();
+                        }
+                        return selectedView != null;
+                    }
+
+                    @Override
+                    public boolean onScale(ScaleGestureDetector d) {
+                        scaleSelected(d.getScaleFactor());
+                        return true;
+                    }
+                });
+
+        setWillNotDraw(false);
+    }
+
+    private void addToolbarButton(String label, final Runnable action) {
+        Button b = new Button(getContext());
+        b.setText(label);
+        b.setAllCaps(false);
+        b.setMinWidth(dpToPx(44));
+        b.setMinimumWidth(dpToPx(44));
+        b.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { action.run(); }
+        });
+        editToolbar.addView(b);
+    }
+
+    private void enterEditMode() {
+        togglePointerId = -1;
+        // Release anything currently held so nothing gets stuck while editing
+        for (Integer id : new ArrayList<>(pointerStates.keySet())) {
+            releasePointer(id);
+        }
+        if (leftJoyPointerId != -1) {
+            resetJoystick(findViewById(R.id.left_analog));
+            leftJoyPointerId = -1;
+        }
+        if (rightJoyPointerId != -1) {
+            resetJoystick(findViewById(R.id.right_analog));
+            rightJoyPointerId = -1;
+        }
+        if (hatX != 0 || hatY != 0) {
+            hatX = 0;
+            hatY = 0;
+            SDLControllerManager.onNativeHat(virtualDeviceId, 0, 0, 0);
+            updateDpadVisual(0, 0);
+        }
+        editMode = true;
+        selectedView = null;
+        dragging = false;
+        editToolbar.setVisibility(View.VISIBLE);
+        editToggle.setVisibility(View.GONE);
+        invalidate();
+    }
+
+    private void exitEditMode() {
+        saveLayout();
+        editMode = false;
+        selectedView = null;
+        dragging = false;
+        editToolbar.setVisibility(View.GONE);
+        editToggle.setVisibility(View.VISIBLE);
+        invalidate();
+    }
+
+    private void scaleSelected(float factor) {
+        if (selectedView == null) return;
+        float sc = selectedView.getScaleX() * factor;
+        sc = Math.max(MIN_SCALE, Math.min(MAX_SCALE, sc));
+        selectedView.setScaleX(sc);
+        selectedView.setScaleY(sc);
+        invalidate();
+    }
+
+    private void moveSelected(float dx, float dy) {
+        View v = selectedView;
+        if (v == null) return;
+        float ox = v.getTranslationX();
+        float oy = v.getTranslationY();
+        v.setTranslationX(ox + dx);
+        v.setTranslationY(oy + dy);
+        RectF r = rectOf(v);
+        // Keep the control's center on screen so it can't get lost
+        if (r.centerX() < 0 || r.centerX() > getWidth() || r.centerY() < 0 || r.centerY() > getHeight()) {
+            v.setTranslationX(ox);
+            v.setTranslationY(oy);
+        }
+        invalidate();
+    }
+
+    // Picks the smallest visible control under the finger (so buttons win over big areas)
+    private View editableAt(float x, float y) {
+        View best = null;
+        float bestArea = Float.MAX_VALUE;
+        for (int id : editableIds) {
+            View v = findViewById(id);
+            if (v == null || v.getVisibility() != View.VISIBLE) continue;
+            RectF r = rectOf(v);
+            if (r.contains(x, y)) {
+                float area = r.width() * r.height();
+                if (area < bestArea) {
+                    bestArea = area;
+                    best = v;
+                }
+            }
+        }
+        return best;
+    }
+
+    private View toolbarButtonAt(float x, float y) {
+        if (editToolbar == null || editToolbar.getVisibility() != View.VISIBLE) return null;
+        for (int i = 0; i < editToolbar.getChildCount(); i++) {
+            View c = editToolbar.getChildAt(i);
+            if (!(c instanceof Button)) continue;
+            RectF r = rectOf(c);
+            r.inset(-dpToPx(4), -dpToPx(4));
+            if (r.contains(x, y)) return c;
+        }
+        return null;
+    }
+
+    private boolean handleEditTouch(MotionEvent ev) {
+        scaleDetector.onTouchEvent(ev);
+        switch (ev.getActionMasked()) {
+            case MotionEvent.ACTION_DOWN: {
+                float x = ev.getX();
+                float y = ev.getY();
+                View tb = toolbarButtonAt(x, y);
+                if (tb != null) {
+                    dragging = false;
+                    tb.performClick();
+                    return true;
+                }
+                View hit = editableAt(x, y);
+                if (hit != null) {
+                    selectedView = hit;
+                    dragging = true;
+                    lastTouchX = x;
+                    lastTouchY = y;
+                } else {
+                    dragging = false;
+                }
+                invalidate();
+                break;
+            }
+            case MotionEvent.ACTION_POINTER_DOWN:
+                dragging = false;
+                break;
+            case MotionEvent.ACTION_MOVE:
+                if (dragging && ev.getPointerCount() == 1 && !scaleDetector.isInProgress()) {
+                    float x = ev.getX();
+                    float y = ev.getY();
+                    moveSelected(x - lastTouchX, y - lastTouchY);
+                    lastTouchX = x;
+                    lastTouchY = y;
+                }
+                break;
+            case MotionEvent.ACTION_UP:
+            case MotionEvent.ACTION_CANCEL:
+                dragging = false;
+                saveLayout();
+                break;
+        }
+        return true;
+    }
+
+    @Override
+    protected void dispatchDraw(Canvas canvas) {
+        super.dispatchDraw(canvas);
+        if (!editMode) return;
+        for (int id : editableIds) {
+            View v = findViewById(id);
+            if (v == null || v.getVisibility() != View.VISIBLE) continue;
+            canvas.drawRect(rectOf(v), v == selectedView ? selectedPaint : outlinePaint);
+        }
+    }
+
+    // Position/size of a control in this overlay's coordinates, including
+    // translation and scale (getLocationOnScreen already applies transforms).
+    private RectF rectOf(View v) {
+        int[] loc = new int[2];
+        int[] pLoc = new int[2];
+        v.getLocationOnScreen(loc);
+        getLocationOnScreen(pLoc);
+        float left = loc[0] - pLoc[0];
+        float top = loc[1] - pLoc[1];
+        return new RectF(left, top,
+                left + v.getWidth() * v.getScaleX(),
+                top + v.getHeight() * v.getScaleY());
+    }
 
     public int getPhysicalJoystickCount() {
         int count = 0;
@@ -84,6 +433,10 @@ public class ControllerOverlay extends RelativeLayout {
 
     @Override
     public boolean onTouchEvent(MotionEvent event) {
+        if (editMode) {
+            return handleEditTouch(event);
+        }
+
         int action = event.getActionMasked();
         int index = event.getActionIndex();
         int pId = event.getPointerId(index);
@@ -91,6 +444,22 @@ public class ControllerOverlay extends RelativeLayout {
         // Get raw coordinates for global hit detection
         float x = event.getX(index);
         float y = event.getY(index);
+
+        // Gear (top-left): long-press opens the layout editor
+        if (action == MotionEvent.ACTION_CANCEL) {
+            removeCallbacks(enterEditRunnable);
+            togglePointerId = -1;
+        } else if ((action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_POINTER_DOWN)
+                && isViewAtLocation(editToggle, x, y)) {
+            togglePointerId = pId;
+            postDelayed(enterEditRunnable, 700);
+            return true;
+        } else if ((action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_POINTER_UP)
+                && pId == togglePointerId) {
+            removeCallbacks(enterEditRunnable);
+            togglePointerId = -1;
+            return true;
+        }
 
         if (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_POINTER_DOWN) {
             // Check Joysticks first
@@ -105,6 +474,7 @@ public class ControllerOverlay extends RelativeLayout {
         } else if (action == MotionEvent.ACTION_MOVE) {
             for (int i = 0; i < event.getPointerCount(); i++) {
                 int movePId = event.getPointerId(i); // The stable ID
+                if (movePId == togglePointerId) continue; // finger resting on the gear
 
                 // Get coordinates specifically for THIS pointer index
                 float mx = event.getX(i);
@@ -144,10 +514,11 @@ public class ControllerOverlay extends RelativeLayout {
         if (!(v instanceof JoystickOverlay)) return;
         JoystickOverlay joy = (JoystickOverlay) v;
 
-        // LOCAL CENTER CALCULATION
-        float centerX = v.getLeft() + (v.getWidth() / 2f);
-        float centerY = v.getTop() + (v.getHeight() / 2f);
-        float radius = v.getWidth() / 3f;
+        // On-screen center/radius (includes the user's move/resize)
+        RectF r = rectOf(v);
+        float centerX = r.centerX();
+        float centerY = r.centerY();
+        float radius = r.width() / 3f;
 
         float dx = x - centerX;
         float dy = y - centerY;
@@ -158,8 +529,12 @@ public class ControllerOverlay extends RelativeLayout {
             dy = (dy / distance) * radius;
         }
 
-        joy.updateVisualPos((v.getWidth()/2f) + dx, (v.getHeight()/2f) + dy);
-        joy.sendToSDL(dx / radius, dy / radius);
+        float nx = dx / radius;
+        float ny = dy / radius;
+        // The view draws in its own (unscaled) coordinates
+        joy.updateVisualPos((v.getWidth() / 2f) + nx * (v.getWidth() / 3f),
+                (v.getHeight() / 2f) + ny * (v.getWidth() / 3f));
+        joy.sendToSDL(nx, ny);
     }
 
     private void resetJoystick(View v) {
@@ -260,10 +635,11 @@ public class ControllerOverlay extends RelativeLayout {
             View container = findViewById(R.id.dpad_container);
             if (container == null) return;
 
-            // Use Local coordinates to match event.getX()
-            float centerX = container.getLeft() + (container.getWidth() / 2f);
-            float centerY = container.getTop() + (container.getHeight() / 2f);
-            float radius = container.getWidth() / 2f;
+            // On-screen center/radius (includes the user's move/resize)
+            RectF cr = rectOf(container);
+            float centerX = cr.centerX();
+            float centerY = cr.centerY();
+            float radius = cr.width() / 2f;
 
             for (int i = 0; i < event.getPointerCount(); i++) {
                 if (action == MotionEvent.ACTION_POINTER_UP && i == event.getActionIndex()) continue;
@@ -347,19 +723,10 @@ public class ControllerOverlay extends RelativeLayout {
         View v = findViewById(viewId);
         if (v == null) return;
 
-        int[] loc = new int[2];
-        int[] parentLoc = new int[2];
-        v.getLocationOnScreen(loc);
-        this.getLocationOnScreen(parentLoc);
-
-        // Calculate coordinates with padding
-        int left   = loc[0] - parentLoc[0] - pad;
-        int top    = loc[1] - parentLoc[1] - pad;
-        int right  = left + v.getWidth() + pad*2;
-        int bottom = top + v.getHeight() + pad*2;
-
-        // Add if in region + padding
-        if (x >= left && x <= right && y >= top && y <= bottom) {
+        // Region (with move/resize applied) + padding
+        RectF r = rectOf(v);
+        r.inset(-pad, -pad);
+        if (r.contains(x, y)) {
             set.add(code);
         }
     }
@@ -375,18 +742,7 @@ public class ControllerOverlay extends RelativeLayout {
     private boolean isViewAtLocation(View v, float x, float y) {
         if (v == null || v.getVisibility() != View.VISIBLE) return false;
 
-        int[] vLoc = new int[2];
-        v.getLocationOnScreen(vLoc); // Global position of button
-
-        int[] parentLoc = new int[2];
-        this.getLocationOnScreen(parentLoc); // Global position of the overlay
-
-        // Get the position of the button RELATIVE to the overlay
-        int relativeLeft = vLoc[0] - parentLoc[0];
-        int relativeTop = vLoc[1] - parentLoc[1];
-
-        return x >= relativeLeft && x <= (relativeLeft + v.getWidth()) &&
-                y >= relativeTop && y <= (relativeTop + v.getHeight());
+        return rectOf(v).contains(x, y);
     }
 
     public ControllerOverlay(Context context) {
@@ -400,6 +756,9 @@ public class ControllerOverlay extends RelativeLayout {
         LayoutInflater inflater = LayoutInflater.from(context);
         View vc = inflater.inflate(R.layout.virtual_controller, this, true);
         disableAllTouches(vc);
+        setClipChildren(false);
+        buildEditorUi(context);
+        loadLayout();
     }
 
     private void disableAllTouches(View v) {
@@ -407,6 +766,9 @@ public class ControllerOverlay extends RelativeLayout {
         v.setFocusable(false);
         if (v instanceof ViewGroup) {
             ViewGroup vg = (ViewGroup) v;
+            // Moved/scaled controls must be allowed to draw outside their old parent bounds
+            vg.setClipChildren(false);
+            vg.setClipToPadding(false);
             for (int i = 0; i < vg.getChildCount(); i++) {
                 disableAllTouches(vg.getChildAt(i));
             }
